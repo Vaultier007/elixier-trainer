@@ -538,9 +538,8 @@ const SUPABASE_KEY="sb_publishable_Ifhz8-Fx2aSxxfOHNurx1w_yNlrGkkS";
 function makeSupaRoom(){
   if(!SUPABASE_URL||!SUPABASE_KEY||typeof supabase==="undefined")return null;
   const me=Math.random().toString(36).slice(2,10);
-  const client=supabase.createClient(SUPABASE_URL,SUPABASE_KEY,{auth:{persistSession:false,autoRefreshToken:false},realtime:{params:{eventsPerSecond:40}}});
-  const ch=client.channel("elixier-trainer-lobby",{config:{presence:{key:me},broadcast:{self:false}}});
-  let meta={},trackT=0,conn=false,peersFns=[],connFns=[];
+  const client=supabase.createClient(SUPABASE_URL,SUPABASE_KEY,{auth:{persistSession:false,autoRefreshToken:false},realtime:{params:{eventsPerSecond:40},worker:true}});
+  let ch=null,meta={},trackT=0,conn=false,peersFns=[],connFns=[],retryT=0,gen=0;
   const stCache={},listeners={};
   function build(){
     const ps=ch.presenceState(),out=[];
@@ -555,22 +554,33 @@ function makeSupaRoom(){
     return out;
   }
   const fire=()=>{const peers=build();peersFns.forEach(f=>{try{f({peers,joined:[],left:[],updated:[]})}catch(e){console.error(e)}})};
-  ch.on("presence",{event:"sync"},fire);
-  ch.on("broadcast",{event:"st"},({payload})=>{if(!payload||typeof payload.from!=="string")return;stCache[payload.from]=payload.st;fire()});
-  ch.on("broadcast",{event:"msg"},({payload})=>{
-    if(!payload||typeof payload.topic!=="string")return;
-    (listeners[payload.topic]||[]).forEach(f=>f({peer:payload.from,data:payload.data,topic:payload.topic,isMe:false,sameTab:false,kind:"viewer",guest:false,by:null}));
-  });
-  ch.subscribe(status=>{
-    const c=status==="SUBSCRIBED";
-    if(c)ch.track(meta).catch(()=>{});
-    if(c!==conn){conn=c;connFns.forEach(f=>f(c))}
-  });
-  const track=()=>{clearTimeout(trackT);trackT=setTimeout(()=>{if(conn)ch.track(meta).catch(()=>{})},120)};
+  const setConn=c=>{if(c!==conn){conn=c;connFns.forEach(f=>f(c))}};
+  function connect(){
+    const my=++gen;
+    ch=client.channel("elixier-trainer-lobby",{config:{presence:{key:me},broadcast:{self:false}}});
+    ch.on("presence",{event:"sync"},()=>{if(my===gen)fire()});
+    ch.on("broadcast",{event:"st"},({payload})=>{if(my!==gen||!payload||typeof payload.from!=="string")return;stCache[payload.from]=payload.st;fire()});
+    ch.on("broadcast",{event:"msg"},({payload})=>{
+      if(my!==gen||!payload||typeof payload.topic!=="string")return;
+      (listeners[payload.topic]||[]).forEach(f=>f({peer:payload.from,data:payload.data,topic:payload.topic,isMe:false,sameTab:false,kind:"viewer",guest:false,by:null}));
+    });
+    ch.subscribe(status=>{
+      if(my!==gen)return;
+      if(status==="SUBSCRIBED"){clearTimeout(retryT);ch.track(meta).catch(()=>{});setConn(true)}
+      else if(status==="CLOSED"||status==="CHANNEL_ERROR"||status==="TIMED_OUT"){setConn(false);scheduleRetry(2000)}
+    });
+  }
+  function reconnect(){const old=ch;ch=null;if(old)client.removeChannel(old).catch(()=>{});connect()}
+  function scheduleRetry(ms){clearTimeout(retryT);retryT=setTimeout(()=>{if(!conn)reconnect()},ms)}
+  document.addEventListener("visibilitychange",()=>{if(!document.hidden&&!conn)reconnect()});
+  window.addEventListener("online",()=>{if(!conn)reconnect()});
+  setInterval(()=>{if(!conn&&!document.hidden)reconnect()},8000);
+  connect();
+  const track=()=>{clearTimeout(trackT);trackT=setTimeout(()=>{if(conn&&ch)ch.track(meta).catch(()=>{})},120)};
   return {
     presence(patch){
       patch=Object.assign({},patch);
-      if("st" in patch){const st=patch.st;delete patch.st;if(st)ch.send({type:"broadcast",event:"st",payload:{from:me,st}}).catch(()=>{})}
+      if("st" in patch){const st=patch.st;delete patch.st;if(st&&ch&&conn)ch.send({type:"broadcast",event:"st",payload:{from:me,st}}).catch(()=>{})}
       let changed=false;
       for(const k in patch){
         if(patch[k]===null){if(k in meta){delete meta[k];changed=true}}
@@ -579,7 +589,7 @@ function makeSupaRoom(){
       if(changed)track();
       return Promise.resolve();
     },
-    emit(topic,data){return ch.send({type:"broadcast",event:"msg",payload:{from:me,topic,data}}).then(()=>{})},
+    emit(topic,data){return ch?ch.send({type:"broadcast",event:"msg",payload:{from:me,topic,data}}).then(()=>{}):Promise.resolve()},
     on(topic,fn){(listeners[topic]=listeners[topic]||[]).push(fn);return()=>{listeners[topic]=listeners[topic].filter(x=>x!==fn)}},
     onPeers(fn){peersFns.push(fn);setTimeout(fire,0);return()=>{peersFns=peersFns.filter(x=>x!==fn)}},
     onConnection(fn){connFns.push(fn);setTimeout(()=>fn(conn),0);return()=>{connFns=connFns.filter(x=>x!==fn)}},
@@ -1594,7 +1604,7 @@ function hostGame(){
   if(!NET.room)return noRoom();
   if(M.net)netLeave();
   const A="abcdefghjkmnpqrstuvwxyz23456789",code=Array.from({length:4},()=>A[ri(A.length)]).join("");
-  M.net={role:"host",code,seq:0,fx:[],fxId:0,lastSend:0,live:false,guestPeer:null};
+  M.net={role:"host",code,seq:Date.now(),fx:[],fxId:0,lastSend:0,live:false,guestPeer:null};
   $("#m-host").disabled=$("#m-join").disabled=true;
   NET.room.presence({role:"host",game:code,deck:M.deck,busy:false,st:null}).catch(()=>{});
   netStatus(`Dein Spiel: <b>${code.toUpperCase()}</b> · Dein Freund sieht es jetzt als Button „Spiel ${code.toUpperCase()} beitreten“ oder gibt den Code ein. Lass diese Seite offen.`);
@@ -1619,20 +1629,24 @@ function onNetPeers(){
   const net=M.net;if(!net)return;
   if(net.role==="host"){
     const g=others().find(p=>p.presence&&p.presence.role==="guest"&&p.presence.game===net.code);
-    if(g&&!net.guestPeer){
+    if(g&&!net.guestPeer&&g.peer===net.lostGuest&&!M.over&&M.time>0){
+      net.guestPeer=g.peer;net.lostGuest=null;M.running=true;M.last=performance.now();
+      NET.room.presence({busy:true}).catch(()=>{});
+      netStatus(`Dein Freund ist wieder verbunden (Spiel <b>${net.code.toUpperCase()}</b>). Weiter geht's!`);
+    }else if(g&&!net.guestPeer){
       net.guestPeer=g.peer;net.guestDeck=MDECKS[g.presence.deck]?g.presence.deck:"hog";
       NET.room.presence({busy:true}).catch(()=>{});
       netStatus(`Freund verbunden (Spiel <b>${net.code.toUpperCase()}</b>). Los geht's!`);startNetMatch();
     }else if(net.guestPeer&&!g){
-      net.guestPeer=null;NET.room.presence({busy:false}).catch(()=>{});
-      if(M.running){M.running=false;tip("warn","Dein Freund hat die Verbindung verloren.",true)}
-      netStatus(`Dein Freund hat das Spiel verlassen. Er kann Spiel <b>${net.code.toUpperCase()}</b> wieder beitreten.`);
+      net.lostGuest=net.guestPeer;net.guestPeer=null;
+      if(M.running){M.running=false;$("#m-tipline").innerHTML='<span class="dot warn"></span><span>Verbindung zu deinem Freund unterbrochen. Das Match ist pausiert und läuft weiter, sobald er zurück ist.</span>'}
+      netStatus(`Verbindung zu deinem Freund unterbrochen. Das Match ist pausiert. Er kann Spiel <b>${net.code.toUpperCase()}</b> auch neu beitreten.`);
     }
     return;
   }
   const h=others().find(p=>p.presence&&p.presence.role==="host"&&p.presence.game===net.code);
   if(!h){
-    if(net.hostSeen&&M.running){M.running=false;netStatus("Der Gastgeber hat das Spiel verlassen.");$("#m-tipline").innerHTML='<span class="dot warn"></span><span>Verbindung zum Gastgeber verloren.</span>'}
+    if(net.hostSeen&&M.running){M.running=false;netStatus("Verbindung zum Gastgeber unterbrochen. Sobald er wieder da ist, geht es weiter.");$("#m-tipline").innerHTML='<span class="dot warn"></span><span>Verbindung zum Gastgeber unterbrochen, warte …</span>'}
     return;
   }
   if(!net.hostSeen){net.hostSeen=true;netStatus(`Spiel <b>${net.code.toUpperCase()}</b> gefunden. Warte auf den Start …`)}
@@ -1654,7 +1668,7 @@ function pack(){
   for(const x of U){if(x.tower||x.hp<=0)continue;
     u.push([x.id,CI[x.card],x.side,Math.round(x.x*10),Math.round(x.y*10),Math.max(1,Math.round(x.hp/x.max*100)),(x.deploy>0?1:0)|(x.stun>0?2:0)|(x.flash>.6?4:0)|(x.dir>0?8:0)])}
   for(const f of FX)if((f.k==="boom"||f.k==="drop")&&!f.net){f.net=1;M.net.fx.push([++M.net.fxId,f.k==="drop"?1:0,CI[f.card]??-1,Math.round(f.x*10),Math.round(f.y*10),Math.round((f.rad||1)*10),f.side??0]);if(M.net.fx.length>8)M.net.fx.shift()}
-  const st={v:++M.net.seq,t:Math.round(M.time*10),e:Math.round(M.el[1]*10),h:M.hand[1].map(c=>CI[c]),n:CI[M.queue[1][0]],c:M.crowns.slice(),
+  const st={g:M.net.code,v:++M.net.seq,t:Math.round(M.time*10),e:Math.round(M.el[1]*10),h:M.hand[1].map(c=>CI[c]),n:CI[M.queue[1][0]],c:M.crowns.slice(),
     tw:U.filter(t=>t.tower).map(t=>[Math.max(0,Math.ceil(t.hp)),t.active?1:0]),fx:M.net.fx,o:M.over?1:0,d:M.deck,u};
   while(JSON.stringify(st).length>3400&&st.u.length)st.u.pop();
   return st;
@@ -1676,9 +1690,10 @@ function guestBegin(){
 }
 function applyState(st){
   const net=M.net;
-  if(!Array.isArray(st.u)||!Array.isArray(st.tw)||!Array.isArray(st.h))return;
+  if(!Array.isArray(st.u)||!Array.isArray(st.tw)||!Array.isArray(st.h)||st.g!==net.code)return;
   if(!net.started||(M.over&&!st.o&&st.t<50))guestBegin();
   if(st.v<=net.lastV)return;net.lastV=st.v;
+  if(!M.running&&!M.over&&!st.o){M.running=true;netStatus(`Verbunden mit Code <b>${net.code.toUpperCase()}</b>. Viel Erfolg!`)}
   M.time=(+st.t||0)/10;M.el[0]=Math.min(10,(+st.e||0)/10);
   const cr=[+st.c[1]||0,+st.c[0]||0];if(cr[0]!==M.crowns[0]||cr[1]!==M.crowns[1]){M.crowns=cr;renderCrowns()}
   const hand=st.h.map(i=>CIDX[i]).filter(Boolean),next=CIDX[st.n];
